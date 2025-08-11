@@ -166,7 +166,8 @@ def fused_recurrent_ivon_delta_fwd_kernel(
 @triton.heuristics({
     'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
     'USE_FINAL_STATE_GRADIENT': lambda args: args['dht'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+    'WRITE_DH0': lambda args: args['dh0'] is not None,
 })
 @triton.jit(do_not_specialize=['T'])
 def fused_recurrent_ivon_delta_rule_bwd_kernel(
@@ -191,6 +192,7 @@ def fused_recurrent_ivon_delta_rule_bwd_kernel(
     USE_INITIAL_STATE: tl.constexpr,
     USE_FINAL_STATE_GRADIENT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    WRITE_DH0: tl.constexpr,
 ):
     i_v, i_k, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_h = i_nh // H, i_nh % H
@@ -233,7 +235,12 @@ def fused_recurrent_ivon_delta_rule_bwd_kernel(
         b_Gm += tl.load(p_dht, mask=mask_blk.T, other=0).to(tl.float32)
 
     # PRECONDITIONER APPROX: scalar inverse denom (no grad)
-    inv_den = tl.full([BV, BK], inv_denom_scalar, dtype=tl.float32)
+    one      = tl.full((), 1.0, tl.float32)
+    lr_t     = tl.full((), lr, tl.float32)
+    beta1_t  = tl.full((), beta1, tl.float32)
+    wd_t     = tl.full((), weight_decay, tl.float32)
+    inv_den  = tl.full((), inv_denom_scalar, tl.float32)   # scalar preconditioner approx
+    scale_t  = tl.full((), scale, tl.float32) 
 
     # reverse sweep over time
     for _ in range(Tloc):
@@ -253,8 +260,14 @@ def fused_recurrent_ivon_delta_rule_bwd_kernel(
         # map through IVON param step (no grad through denom): m' = m - lr * (g' + wd m) * inv_den
         #    => G_{g'} += -lr * (G_{m'} ⊙ inv_den)
         #       G_m   +=       (G_{m'} ⊙ (1 - lr*wd*inv_den))
-        G_gprime = -lr * (b_Gm * inv_den)
-        b_Gm = b_Gm * (1.0 - lr * weight_decay * inv_den)
+        b_Gm += b_q[:, None] * b_do[None, :]
+
+        # map through IVON param step (no grad through denom)
+        G_gprime = -lr_t * (b_Gm * inv_den)
+        b_Gm     =  b_Gm * (one - lr_t * wd_t * inv_den)
+
+        # through momentum
+        G_ghat = (one - beta1_t) * tl.trans(G_gprime)
 
         # through g' = β1 g + (1-β1) g_hat  => G_{g_hat} += (1-β1) G_{g'}
         G_ghat = (1.0 - beta1) * G_gprime                                      
@@ -303,13 +316,13 @@ def fused_recurrent_ivon_delta_rule_bwd_kernel(
             p_dbeta -= H
             p_beta  -= H
 
-    # write dh0 if requested
-    if USE_INITIAL_STATE:
-        p_dh0 = dh0 + i_nh * K * V + (i_k * BK + tl.arange(0, BK)[:, None]) * V + (i_v * BV + tl.arange(0, BV)[None, :])
-        tl.store(p_dh0, b_Gm.to(p_dh0.dtype.element_ty), mask=mask_blk.T)
-
+    # write dh0 if requested and allocated
+    if WRITE_DH0:
+        p_dh0 = dh0 + i_nh * K * V \
+              + (i_k * BK + tl.arange(0, BK)[:, None]) * V \
+              + (i_v * BV + tl.arange(0, BV)[None, :])
+        tl.store(p_dh0, b_Gm.to(p_dh0.dtype.element_ty), mask=(mask_k[:, None] & mask_v[None, :]))
     tl.debug_barrier()
-
 
     # rebuild memory forward to compute dq with updated memory and add dk_term2 = (β A_v) * m
     b_m = tl.zeros([BV, BK], dtype=tl.float32)
@@ -352,11 +365,10 @@ def fused_recurrent_ivon_delta_rule_bwd_kernel(
         #   g_hat = - u ⊗ k
         #   g'    = β1 g + (1-β1) g_hat  (we ignore g state; absorb into scale via (1-β1))
         #   m'    = m - lr * ((1-β1) g_hat + wd m) * inv_den
-        g_hatT = - (b_k[None, :] * b_u[:, None])                                
-        b_m = b_m - lr * ( (1.0 - beta1) * g_hatT + weight_decay * b_m ) * inv_den
+        g_hatT = -(b_k[None, :] * b_u[:, None])  # [BV,BK]
+        b_m    =  b_m - lr_t * ((one - beta1_t) * g_hatT + wd_t * b_m) * inv_den
 
-        # dq = (m' q)
-        b_dq = tl.sum(b_m * b_q[None, :], axis=1)
+        b_dq = tl.sum(b_m * b_do[:, None], axis=0) * scale_t 
         tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), mask=mask_k)
 
         p_q  += H * K
