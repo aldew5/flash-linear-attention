@@ -221,6 +221,7 @@ def fused_recurrent_ivon_delta_rule_bwd_kernel(
     p_do = do + (bos * H + i_h) * V + i_v * BV + tl.arange(0, BV) + (Tloc - 1) * H * V
     p_dk = dk + ((i_v * allT + bos) * H + i_h) * K + i_k * BK + tl.arange(0, BK) + (Tloc - 1) * H * K
     p_dv = dv + ((i_k * allT + bos) * H + i_h) * V + i_v * BV + tl.arange(0, BV) + (Tloc - 1) * H * V
+    
     if IS_BETA_HEADWISE:
         p_beta  = beta + (bos + Tloc - 1) * H * V + i_h * V + i_v * BV + tl.arange(0, BV)
         p_dbeta = db   + ((i_v * NK + i_k) * allT + bos + Tloc - 1) * H * V + i_h * V + tl.arange(0, BV)
@@ -235,12 +236,12 @@ def fused_recurrent_ivon_delta_rule_bwd_kernel(
         b_Gm += tl.load(p_dht, mask=mask_blk.T, other=0).to(tl.float32)
 
     # PRECONDITIONER APPROX: scalar inverse denom (no grad)
-    one      = tl.full((), 1.0, tl.float32)
-    lr_t     = tl.full((), lr, tl.float32)
-    beta1_t  = tl.full((), beta1, tl.float32)
-    wd_t     = tl.full((), weight_decay, tl.float32)
-    inv_den  = tl.full((), inv_denom_scalar, tl.float32)   # scalar preconditioner approx
-    scale_t  = tl.full((), scale, tl.float32) 
+    one = tl.full((), 1.0, tl.float32)
+    lr_t = tl.full((), lr, tl.float32)
+    beta1_t = tl.full((), beta1, tl.float32)
+    wd_t = tl.full((), weight_decay, tl.float32)
+    inv_den = tl.full((), inv_denom_scalar, tl.float32)   # scalar preconditioner approx
+    scale_t = tl.full((), scale, tl.float32) 
 
     # reverse sweep over time
     for _ in range(Tloc):
@@ -258,8 +259,8 @@ def fused_recurrent_ivon_delta_rule_bwd_kernel(
         b_Gm += b_q[:, None] * b_do[None, :]
 
         # map through IVON param step (no grad through denom): m' = m - lr * (g' + wd m) * inv_den
-        #    => G_{g'} += -lr * (G_{m'} ⊙ inv_den)
-        #       G_m   +=       (G_{m'} ⊙ (1 - lr*wd*inv_den))
+        #    => G_{g'} += -lr * (G_{m'} \odot inv_den)
+        #       G_m   += (G_{m'} \odot (1 - lr*wd*inv_den))
         b_Gm += b_q[:, None] * b_do[None, :]
 
         # map through IVON param step (no grad through denom)
@@ -269,7 +270,7 @@ def fused_recurrent_ivon_delta_rule_bwd_kernel(
         # through momentum
         G_ghat = (one - beta1_t) * tl.trans(G_gprime)
 
-        # through g' = β1 g + (1-β1) g_hat  => G_{g_hat} += (1-β1) G_{g'}
+        # through g' = beta_1* g + (1-beta_1) g_hat  => G_{g_hat} += (1-beta_1) G_{g'}
         G_ghat = (1.0 - beta1) * G_gprime                                      
         G_ghat = tl.trans(G_ghat)                                              
 
@@ -280,13 +281,13 @@ def fused_recurrent_ivon_delta_rule_bwd_kernel(
         tl.store(p_Av, A_v.to((Av_buf + 0).dtype.element_ty), mask=mask_v)
 
         # grads wrt v and beta through u = β ⊙ r
-        # dv += - β * A_v
+        # dv += - beta * A_v
         b_dv = -(A_v * b_beta)                                                 
         tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), mask=mask_v)
         # dbeta:
-        #   headwise: dbeta[v] += - r_v * A_v  (we only have u=βr; recover r = u / β, clamped)
-        #   scalar:   dbeta   += sum_v (- r_v * A_v)
-        # NOTE: use safe division; where β≈0, treat r≈0 so term = 0.
+        #  headwise: dbeta[v] += - r_v * A_v  (we only have u= beta * r; recover r = u / beta, clamped)
+        #  scalar:   dbeta += sum_v (- r_v * A_v)
+        # NOTE: use safe division; where beta≈0, treat r≈0 so term = 0.
         r_est = tl.where(b_beta != 0, b_u / b_beta, 0.0)
         if IS_BETA_HEADWISE:
             tl.store(p_dbeta, (-r_est * A_v).to(p_dbeta.dtype.element_ty), mask=mask_v)
@@ -294,18 +295,16 @@ def fused_recurrent_ivon_delta_rule_bwd_kernel(
             db_scalar = tl.sum(-r_est * A_v)
             tl.store(p_dbeta, db_scalar.to(p_dbeta.dtype.element_ty))
 
-        # 5) part of dk from the “− u ⊗ k” structure:  dk += - sum_v G_ghat[v,:] * u_v
+        # part of dk from the “− u \otimes k” structure:  dk += - sum_v G_ghat[v,:] * u_v
         dk_term1 = -tl.sum(G_ghat * b_u[:, None], axis=0)                       
         tl.store(p_dk, dk_term1.to(p_dk.dtype.element_ty), mask=mask_k)
 
-        # residual→memory path (like your -Hᵗ d u term, but as a direct add to G_m):
-        # u = β r, r = v - (·) ⇒ ∂u/∂m ≈ β * (-k^T)  ⇒  G_m += (β ⊙ A_v) ⊗ k
+        # residual→memory path
         b_Gm += ( (b_beta * A_v)[:, None] * b_k[None, :] ).T                    
 
-        # move one step back
-        p_q  -= H * K
-        p_k  -= H * K
-        p_u  -= H * V
+        p_q -= H * K
+        p_k -= H * K
+        p_u -= H * V
         p_do -= H * V
         p_dk -= H * K
         p_dv -= H * V
@@ -324,7 +323,7 @@ def fused_recurrent_ivon_delta_rule_bwd_kernel(
         tl.store(p_dh0, b_Gm.to(p_dh0.dtype.element_ty), mask=(mask_k[:, None] & mask_v[None, :]))
     tl.debug_barrier()
 
-    # rebuild memory forward to compute dq with updated memory and add dk_term2 = (β A_v) * m
+    # rebuild memory forward to compute dq with updated memory and add dk_term2 = (beta * A_v) * m
     b_m = tl.zeros([BV, BK], dtype=tl.float32)
     if USE_INITIAL_STATE:
         p_m0 = h0 + i_nh * K * V + (i_k * BK + tl.arange(0, BK)[None, :]) * V + (i_v * BV + tl.arange(0, BV)[:, None])
@@ -363,9 +362,9 @@ def fused_recurrent_ivon_delta_rule_bwd_kernel(
         # update memory forward using IVON but with u precomputed:
         # here we **only** need m' for dq, so we can emulate param step with g' from u:
         #   g_hat = - u ⊗ k
-        #   g'    = β1 g + (1-β1) g_hat  (we ignore g state; absorb into scale via (1-β1))
-        #   m'    = m - lr * ((1-β1) g_hat + wd m) * inv_den
-        g_hatT = -(b_k[None, :] * b_u[:, None])  # [BV,BK]
+        #   g' = beta_1* g + (1-beta_1) g_hat  (we ignore g state; absorb into scale via (1-beta_1))
+        #   m' = m - lr * ((1-beta_1) g_hat + wd m) * inv_den
+        g_hatT = -(b_k[None, :] * b_u[:, None]) 
         b_m    =  b_m - lr_t * ((one - beta1_t) * g_hatT + wd_t * b_m) * inv_den
 
         b_dq = tl.sum(b_m * b_do[:, None], axis=0) * scale_t 
