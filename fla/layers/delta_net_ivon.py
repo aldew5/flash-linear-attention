@@ -57,8 +57,8 @@ class DeltaNetIVON(nn.Module):
         lr: float = 1e-3,
         beta1: float = 0.9,
         beta2: float = 0.999,
-        weight_decay: float = 0.0,   # δ in the write rule
-        lam: float = 1.0,            # λ for sigma: 1/sqrt(λ(h+δ))
+        weight_decay: float = 0.0,   # delta in the write rule
+        lam: float = 1.0,            # lambda for sigma: 1/sqrt(lam(h+delta))
         rng_seed: int = 12345,
     ):
         super().__init__()
@@ -181,9 +181,9 @@ class DeltaNetIVON(nn.Module):
 
     def _make_beta(self, hidden_states, q):
         if self.use_beta:
-            beta = self.b_proj(hidden_states).sigmoid()  # [B,T,H]
+            beta = self.b_proj(hidden_states).sigmoid()  
         else:
-            beta = torch.ones_like(q[..., 0])            # [B,T,H]
+            beta = torch.ones_like(q[..., 0])            
         if self.allow_neg_eigval:
             beta = beta * 2.
         return beta
