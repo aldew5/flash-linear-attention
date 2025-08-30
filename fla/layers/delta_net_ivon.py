@@ -185,7 +185,7 @@ class DeltaNetIVON(nn.Module):
         else:
             beta = torch.ones_like(q[..., 0])            
         if self.allow_neg_eigval:
-            beta = beta * 2.
+            beta = beta * 2. -1.
         return beta
 
     def _alloc_states_if_needed(self, N, H, K, V, device, dtype, last_state):
@@ -212,7 +212,7 @@ class DeltaNetIVON(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional["Cache"] = None,
-        use_cache: Optional[bool] = False,
+        use_cache: Optional[bool] = True,
         output_attentions: Optional[bool] = False,
         **kwargs: "Unpack[Dict]"
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional["Cache"]]:
@@ -281,13 +281,15 @@ class DeltaNetIVON(nn.Module):
         # update cache
         if past_key_values is not None:
             past_key_values.update(
-                recurrent_state=final_state if use_cache else m0,  # if not caching, m0 has been updated in-place
+                recurrent_state=final_state,  # if not caching, m0 has been updated in-place
                 ivon_h_state=h_state,                              # updated in-place
                 ivon_g_state=g_state,                              # updated in-place
                 conv_state=None,                                   # add conv state if you also want to cache it
                 layer_idx=self.layer_idx,
                 offset=q_len
             )
+        else:
+            m0.copy_(final_state)
 
         # output gating + norm + projection (same as original)
         if self.use_gate:

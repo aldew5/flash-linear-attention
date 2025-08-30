@@ -120,6 +120,7 @@ def fused_recurrent_ivon_delta_fwd_kernel(
 
         u_gated = resid * b_beta                   # β ⊙ r
         tl.store(p_u, u_gated.to(p_u.dtype.element_ty), mask=mask_v)
+        p_u += Hh * Vd
 
         # TODO: need grad to compute hessian estimate. might be incorrect to have here
         g_hat = -(resid[:, None] * bk[None, :])
@@ -255,9 +256,6 @@ def fused_recurrent_ivon_delta_rule_bwd_kernel(
         else:
             b_beta = tl.load(p_beta).to(tl.float32)                             
 
-        # readout contribution: G_{m'} += q ⊗ do^T
-        b_Gm += b_q[:, None] * b_do[None, :]
-
         # map through IVON param step (no grad through denom): m' = m - lr * (g' + wd m) * inv_den
         #    => G_{g'} += -lr * (G_{m'} \odot inv_den)
         #       G_m   += (G_{m'} \odot (1 - lr*wd*inv_den))
@@ -268,17 +266,19 @@ def fused_recurrent_ivon_delta_rule_bwd_kernel(
         b_Gm     =  b_Gm * (one - lr_t * wd_t * inv_den)
 
         # through momentum
-        G_ghat = (one - beta1_t) * tl.trans(G_gprime)
-
-        # through g' = beta_1* g + (1-beta_1) g_hat  => G_{g_hat} += (1-beta_1) G_{g'}
-        G_ghat = (1.0 - beta1) * G_gprime                                      
-        G_ghat = tl.trans(G_ghat)                                              
+        #g_prime = beta1*g + (1-beta1) g_hat  => adjoint: G_{g_hat} += (1-beta1) * (G_{g'})
+        # shapes: b_Gm: [BK,BV], G_gprime: [BK,BV] -> g_hat was [BV,BK], so transpose here once:
+        G_ghat = (one - beta1_t) * tl.trans(G_gprime)                                           
 
         # helper: A_v = sum_j G_ghat[v,j] * k_j
         A_v = tl.sum(G_ghat * b_k[None, :], axis=1)                            
         # stash for forward sweep (theta-term for dk)
         p_Av = Av_buf + (i_v * allT + (bos + Tloc - 1)) * H * V + i_h * V + tl.arange(0, BV)
-        tl.store(p_Av, A_v.to((Av_buf + 0).dtype.element_ty), mask=mask_v)
+        tl.store(p_Av, A_v.to(p_Av.dtype.element_ty), mask=mask_v)
+        if _ == 0:
+            p_Av = Av_buf + (i_v * allT + (bos + Tloc - 1)) * H * V + i_h * V + tl.arange(0, BV)
+        tl.store(p_Av, A_v.to(p_Av.dtype.element_ty), mask=mask_v)
+        p_Av -= H * V
 
         # grads wrt v and beta through u = β ⊙ r
         # dv += - beta * A_v
